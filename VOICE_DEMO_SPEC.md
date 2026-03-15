@@ -657,3 +657,60 @@ Total venv size: ~150MB (mostly numpy).
 ---
 
 *Spec version: 1.1 — cancel token pattern + cooldown added to section 8*
+
+---
+
+## Implementation Log (2026-03-14)
+
+### What was built
+
+Full working implementation of the spec. All major features functional:
+
+- PTT (hold spacebar → speak → release → Whisper transcription → LLM stream → TTS playback)
+- Hold-spacebar-to-live-chat transition (1.5s silence after speech while holding → arc countdown → LIVE_ACTIVE)
+- Live chat: continuous Float32 PCM streaming over WebSocket, energy-based backend VAD, full STT→LLM→TTS pipeline
+- Conversation history carried across turns (both PTT and live mode)
+- Per-language system prompts (EN / JA), saved separately in settings
+- Config panel with endpoint health-check dots; spacebar blocked while config is open
+- Interrupt detection: speaking during TTS playback cancels audio and sends interrupt to backend
+
+---
+
+### Silero VAD — investigation and resolution
+
+**What was tried:** Silero VAD ONNX model was integrated as the backend live-mode VAD, replacing the simple energy-based approach specified in the spec.
+
+**Root cause of failure:** The mic captured audio at very low amplitude (raw RMS ≈ 0.001, peak ≈ 0.016). Even after RMS normalisation to 0.1, Silero consistently returned speech probability ≈ 0.001–0.003 regardless of whether the user was speaking. Multiple debugging rounds confirmed:
+
+1. **Model version confusion** — the model URL (`snakers4/silero-vad` master branch) delivers a v4 model (uses `state` input) but was briefly suspected to be v5 (uses `h`/`c` inputs). Added startup logging of all input/output tensor names and shapes to detect version at runtime.
+2. **State shape mismatch** — v5 detection code was splitting a `(2,1,128)` combined state into `(2,1,64)` h and c tensors; confirmed irrelevant once v4 was confirmed.
+3. **Float32 vs Int16 transmission** — audio worklet was changed from Int16 to Float32 during the investigation. Silero received correct Float32 data; that was not the cause.
+4. **RMS normalisation** — added normalisation to 0.1 RMS target to compensate for low mic gain. Did not improve Silero output. Confirmed normed_rms=0.1000 in logs but prob remained ≈ 0.001.
+5. **Conclusion** — Silero requires sufficient SNR to distinguish speech from noise. With a low-gain mic (RMS ≈ 0.001 baseline), amplifying to 0.1 RMS produces amplified noise, not a speech-like signal. Silero correctly classifies it as non-speech. The energy-based VAD from the original spec is the right approach for this use case.
+
+**Resolution:** Reverted to energy-based RMS VAD as specified. Removed `onnxruntime` dependency entirely.
+
+---
+
+### Float32 / Int16 bug — broken audio output
+
+After switching the AudioWorklet to emit Float32, two places in the frontend still read audio as `Int16Array`:
+
+- `beginPTTRecording()` VAD computation (used to detect speech onset and trigger the live-mode countdown)
+- Interrupt detection inside the live mode `onmessage` handler
+
+Reading Float32 bytes as Int16 produces garbage values with magnitude ~15 000–32 000. The interrupt RMS was always far above threshold, causing every TTS response to be cancelled immediately on the first audio chunk. Fixed both to use `Float32Array` with direct `s * s` (no `/32768` scaling).
+
+---
+
+### Tuned constants (as shipped)
+
+| Constant | Value | Notes |
+|---|---|---|
+| `LIVE_HOLD_MS` | 1500 ms | Silence duration before live-mode countdown fires (was 3000) |
+| `PTT_VAD_RMS` | 0.03 | Frontend RMS threshold for speech detection during PTT hold |
+| `VAD_RMS_THRESHOLD` | 0.04 | Backend energy VAD threshold |
+| `VAD_ONSET_CHUNKS` | 4 | ~128ms of continuous signal required to confirm speech onset |
+| `VAD_MIN_SPEECH_MS` | 300 ms | Minimum utterance length; shorter segments discarded |
+| `VAD_SILENCE_MS` | 600 ms | Silence duration to end an utterance |
+| `INTERRUPT_RMS_THRESHOLD` | 0.05 | Frontend RMS to detect user speaking over TTS |
