@@ -383,6 +383,11 @@
       <input id="model-input" type="text" placeholder="model name" spellcheck="false">
       <div class="status-dot" style="visibility:hidden"></div>
     </div>
+    <div class="endpoint-row">
+      <label>Key</label>
+      <input id="llm-key-input" type="password" placeholder="API key (optional)" spellcheck="false">
+      <div class="status-dot" style="visibility:hidden"></div>
+    </div>
     <div class="config-actions">
       <div class="lang-toggle">
         <button class="lang-btn active" id="lang-en" onclick="setLang('en')">EN</button>
@@ -438,8 +443,8 @@ const PTT_COOLDOWN_MS         = 800
 const PTT_VAD_RMS             = 0.03   // RMS threshold for speech detection during PTT hold
 const PTT_VAD_ONSET_CHUNKS    = 3      // consecutive above-threshold chunks to confirm speech (~60ms)
 const PTT_VAD_SILENCE_CHUNKS  = 15     // consecutive below-threshold chunks to confirm speech end (~300ms)
-const INTERRUPT_RMS_THRESHOLD = 0.05
-const INTERRUPT_ONSET_CHUNKS  = 4
+const INTERRUPT_RMS_THRESHOLD = 0.08
+const INTERRUPT_ONSET_CHUNKS  = 6
 const API                     = 'http://127.0.0.1:8743'
 
 // ── state ──────────────────────────────────────────────────────────────────────
@@ -468,6 +473,7 @@ async function loadSettings() {
     document.getElementById('llm-input').value           = s.llm_endpoint   || ''
     document.getElementById('tts-input').value           = s.tts_endpoint   || ''
     document.getElementById('model-input').value         = s.llm_model      || ''
+    document.getElementById('llm-key-input').value       = s.llm_api_key    || ''
     document.getElementById('system-prompt-en').value = s.system_prompt_en || ''
     document.getElementById('system-prompt-ja').value = s.system_prompt_ja || ''
     currentLang = s.language || 'en'
@@ -506,6 +512,7 @@ async function saveEndpoints() {
     llm_endpoint:  document.getElementById('llm-input').value.trim(),
     tts_endpoint:  document.getElementById('tts-input').value.trim(),
     llm_model:     document.getElementById('model-input').value.trim(),
+    llm_api_key:   document.getElementById('llm-key-input').value.trim(),
     language:      currentLang,
     voice_en:      'af_heart',
     voice_ja:      'jf_alpha',
@@ -950,12 +957,10 @@ async function enterLiveMode(preBuffer = []) {
         for (const s of samples) sum += s * s
         if (Math.sqrt(sum / samples.length) > INTERRUPT_RMS_THRESHOLD) {
           interruptStreak++
-          if (interruptStreak === 1) {
-            // cut audio immediately on first speech chunk — no streak needed
-            livePlaybackGated = false
+          if (interruptStreak >= INTERRUPT_ONSET_CHUNKS) {
             cancelLivePlayback()
+            triggerInterrupt()
           }
-          if (interruptStreak >= INTERRUPT_ONSET_CHUNKS) triggerInterrupt()
         } else {
           interruptStreak = 0
         }

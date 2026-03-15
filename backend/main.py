@@ -1,9 +1,10 @@
-import asyncio, json, os, subprocess, tempfile
+import asyncio, json, os, subprocess, tempfile, urllib.request
 from pathlib import Path
 from typing import AsyncGenerator
 
 import httpx
 import numpy as np
+import onnxruntime as ort
 import soundfile as sf
 from fastapi import FastAPI, File, Form, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -11,16 +12,41 @@ from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
 
 # ── constants ──────────────────────────────────────────────────────────────────
-VAD_RMS_THRESHOLD  = 0.04   # RMS energy threshold — speech vs silence
-VAD_ONSET_CHUNKS   = 4      # consecutive above-threshold windows to confirm onset (~128ms)
-VAD_SILENCE_MS     = 600    # ms of silence after speech to end utterance
+VAD_THRESHOLD      = 0.4    # Silero speech probability threshold
+VAD_ONSET_CHUNKS   = 2      # consecutive above-threshold windows to confirm onset (~64ms)
+VAD_SILENCE_MS     = 1200   # ms of silence after speech to end utterance
 VAD_MIN_SPEECH_MS  = 300    # discard utterances shorter than this
 VAD_PREBUFFER_MS   = 200    # pre-roll before onset
 SAMPLE_RATE        = 16000
-VAD_CHUNK          = 512    # samples per VAD window (32ms at 16kHz)
+VAD_CHUNK          = 512    # samples per Silero window (32ms at 16kHz)
 SILENCE_WINDOWS    = int(SAMPLE_RATE * VAD_SILENCE_MS / 1000 / VAD_CHUNK)
 MIN_SPEECH_SAMPLES = int(SAMPLE_RATE * VAD_MIN_SPEECH_MS / 1000)
 PREBUFFER_SAMPLES  = int(SAMPLE_RATE * VAD_PREBUFFER_MS / 1000)
+
+# ── Silero VAD ─────────────────────────────────────────────────────────────────
+_MODEL_PATH = Path(__file__).parent.parent / "data" / "silero_vad.onnx"
+_MODEL_URL  = "https://huggingface.co/onnx-community/silero-vad/resolve/main/onnx/model.onnx"
+
+if not _MODEL_PATH.exists():
+    print("Downloading Silero VAD model…")
+    _MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
+    urllib.request.urlretrieve(_MODEL_URL, _MODEL_PATH)
+    print("Silero VAD model downloaded.")
+
+_vad_session = ort.InferenceSession(str(_MODEL_PATH), providers=["CPUExecutionProvider"])
+print(f"[vad] inputs: {[i.name for i in _vad_session.get_inputs()]}")
+
+def _vad_infer(samples: np.ndarray, state: np.ndarray):
+    """Run one 512-sample Silero window. Returns (prob, new_state).
+    samples: float32 array in [-1, 1], shape (512,)
+    state:   float32 array shape (2, 1, 128)
+    """
+    out = _vad_session.run(None, {
+        "input": samples[np.newaxis, :].astype(np.float32),
+        "sr":    np.array([SAMPLE_RATE], dtype=np.int64),
+        "state": state,
+    })
+    return float(out[0][0][0]), out[1]
 
 SETTINGS_PATH = Path(__file__).parent.parent / "data" / "settings.json"
 DEFAULT_SETTINGS = {
@@ -28,6 +54,7 @@ DEFAULT_SETTINGS = {
     "llm_endpoint":    "",
     "tts_endpoint":    "",
     "llm_model":       "",
+    "llm_api_key":     "",
     "language":        "en",
     "voice_en":        "af_heart",
     "voice_ja":        "jf_alpha",
@@ -94,6 +121,7 @@ class SettingsIn(BaseModel):
     llm_endpoint:  str = ""
     tts_endpoint:  str = ""
     llm_model:     str = ""
+    llm_api_key:   str = ""
     language:      str = "en"
     voice_en:        str = "af_heart"
     voice_ja:        str = "jf_alpha"
@@ -108,7 +136,7 @@ async def post_settings(body: SettingsIn):
     async with httpx.AsyncClient(timeout=3) as c:
         for key, url, path in [
             ("stt", s["stt_endpoint"], "/health"),
-            ("llm", s["llm_endpoint"], "/models"),
+            ("llm", s["llm_endpoint"], "/v1/models"),
             ("tts", s["tts_endpoint"], "/health"),
         ]:
             if not url: continue
@@ -149,9 +177,12 @@ async def chat_stream(body: ChatIn):
     async def stream() -> AsyncGenerator[bytes, None]:
         # connect=10: fail fast if LM Studio is unreachable
         # read=30: max silence between tokens before giving up
+        headers = {"Authorization": f"Bearer {s['llm_api_key']}"} if s.get("llm_api_key") else {}
         async with httpx.AsyncClient(timeout=httpx.Timeout(connect=10, read=30, write=10, pool=5)) as c:
-            async with c.stream("POST", s["llm_endpoint"].rstrip("/") + "/chat/completions",
-                                 json={"model": s.get("llm_model") or "local-model", "messages": messages, "stream": True}) as r:
+            async with c.stream("POST", s["llm_endpoint"].rstrip("/") + "/api/chat/completions",
+                                 headers=headers,
+                                 json={"model": s.get("llm_model") or "local-model", "messages": messages, "stream": True,
+                                       "tool_ids": ["local_web_search"]}) as r:
                 async for line in r.aiter_lines():
                     if line.startswith("data: "):
                         yield (line + "\n\n").encode()
@@ -186,7 +217,9 @@ async def live(ws: WebSocket):
     s = load_settings()
 
     # VAD state
+    vad_state = np.zeros((2, 1, 128), dtype=np.float32)
     vad_buf: list[float] = []   # accumulate float32 samples until VAD_CHUNK
+    _vad_last_log = 0.0
 
     # utterance state
     pre_buf: list[bytes] = []
@@ -225,9 +258,11 @@ async def live(ws: WebSocket):
             messages = [{"role": "system", "content": get_system_prompt(s)}] + conv_messages[-20:]
 
             full_text = ""
-            async with client.stream("POST", s["llm_endpoint"].rstrip("/") + "/chat/completions",
+            llm_headers = {"Authorization": f"Bearer {s['llm_api_key']}"} if s.get("llm_api_key") else {}
+            async with client.stream("POST", s["llm_endpoint"].rstrip("/") + "/api/chat/completions",
+                                     headers=llm_headers,
                                      json={"model": s.get("llm_model") or "local-model", "stream": True,
-                                           "messages": messages}) as resp:
+                                           "messages": messages, "tool_ids": ["local_web_search"]}) as resp:
                 async for line in resp.aiter_lines():
                     if not line.startswith("data: "): continue
                     data = line[6:]
@@ -280,6 +315,7 @@ async def live(ws: WebSocket):
                     pre_buf.clear()
                     pre_buf_samples = 0
                     vad_buf.clear()
+                    vad_state = np.zeros((2, 1, 128), dtype=np.float32)
                     await send_json({"type": "interrupted"})
                 elif data.get("type") == "ping":
                     await send_json({"type": "pong"})
@@ -307,12 +343,16 @@ async def live(ws: WebSocket):
                     speech_buf.extend(chunk)
                     speech_samples += n
 
-                # energy-based VAD on each full VAD_CHUNK window
+                # Silero VAD on each full 512-sample window
                 while len(vad_buf) >= VAD_CHUNK:
                     window = np.array(vad_buf[:VAD_CHUNK], dtype=np.float32)
                     vad_buf = vad_buf[VAD_CHUNK:]
-                    rms = float(np.sqrt(np.mean(window ** 2)))
-                    above = rms >= VAD_RMS_THRESHOLD
+                    prob, vad_state = _vad_infer(window, vad_state)
+                    above = prob >= VAD_THRESHOLD
+                    _now = asyncio.get_event_loop().time()
+                    if _now - _vad_last_log >= 0.5:
+                        _vad_last_log = _now
+                        print(f"[vad] prob={prob:.3f} above={above} in_speech={in_speech}", flush=True)
 
                     if not in_speech:
                         if above:
