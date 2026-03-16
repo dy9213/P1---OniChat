@@ -26,7 +26,7 @@ ipcMain.handle('save-settings', (_, s) => {
 
 // ── health poll ───────────────────────────────────────────────────────────────
 function pollHealth(resolve, reject, attempts = 0) {
-  if (attempts > 40) return reject(new Error('Backend did not start in time'))
+  if (attempts > 240) return reject(new Error('Backend did not start in time'))
   http.get(HEALTH_URL, (res) => {
     if (res.statusCode === 200) resolve()
     else setTimeout(() => pollHealth(resolve, reject, attempts + 1), 500)

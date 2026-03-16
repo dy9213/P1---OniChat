@@ -79,6 +79,22 @@
     outline: none;
   }
   .endpoint-row input:focus { border-color: var(--accent); }
+  #tts-mode-btn {
+    flex-shrink: 0;
+    font-size: 11px;
+    padding: 3px 8px;
+    border-radius: 5px;
+    border: 1px solid var(--border);
+    background: var(--surface2);
+    color: var(--text-dim);
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  #tts-mode-btn.local {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+
   .status-dot {
     width: 8px; height: 8px;
     border-radius: 50%;
@@ -376,7 +392,12 @@
     <div class="endpoint-row">
       <label>TTS</label>
       <input id="tts-input" type="text" placeholder="http://…" spellcheck="false">
+      <button id="tts-mode-btn" onclick="toggleTtsMode()" title="Click to cycle: Kokoro → VoiceVox → Local MLX">Kokoro</button>
       <div class="status-dot" id="dot-tts"></div>
+    </div>
+    <div class="endpoint-row" id="voicevox-speaker-row" style="display:none">
+      <label>Speaker</label>
+      <input id="voicevox-speaker-input" type="number" min="0" value="1" style="width:80px" title="VOICEVOX speaker ID">
     </div>
     <div class="endpoint-row">
       <label>Model</label>
@@ -460,6 +481,8 @@ let liveModeToken    = null
 let liveModeTimerId  = null   // setTimeout handle for VAD-driven live transition
 let pttCooldownUntil = 0
 let currentLang      = 'en'
+let ttsMode          = 'kokoro'   // 'local' | 'kokoro' | 'voicevox'
+let liveTtsSampleRate = 24000     // updated from tts_start event
 let chatHistory      = []
 
 // ── DOM refs ───────────────────────────────────────────────────────────────────
@@ -483,7 +506,10 @@ async function loadSettings() {
     document.getElementById('system-prompt-ja').value = s.system_prompt_ja || ''
     document.getElementById('system-prompt-zh').value = s.system_prompt_zh || ''
     currentLang = s.language || 'en'
+    ttsMode = (s.tts_mode === 'remote' ? 'kokoro' : s.tts_mode) || 'kokoro'
+    document.getElementById('voicevox-speaker-input').value = s.voicevox_speaker ?? 1
     updateLangUI()
+    updateTtsModeUI()
     checkConfigWarning()
   } catch {}
 }
@@ -501,6 +527,20 @@ function updateLangUI() {
   document.getElementById('lang-en').classList.toggle('active', currentLang === 'en')
   document.getElementById('lang-ja').classList.toggle('active', currentLang === 'ja')
   document.getElementById('lang-zh').classList.toggle('active', currentLang === 'zh')
+}
+
+function toggleTtsMode() {
+  const cycle = { 'local': 'kokoro', 'kokoro': 'voicevox', 'voicevox': 'local' }
+  ttsMode = cycle[ttsMode] || 'kokoro'
+  updateTtsModeUI()
+}
+
+function updateTtsModeUI() {
+  const btn = document.getElementById('tts-mode-btn')
+  const labels = { 'local': 'Local', 'kokoro': 'Kokoro', 'voicevox': 'VoiceVox' }
+  btn.textContent = labels[ttsMode] || 'Kokoro'
+  btn.classList.toggle('local', ttsMode === 'local')
+  document.getElementById('voicevox-speaker-row').style.display = ttsMode === 'voicevox' ? '' : 'none'
 }
 
 function checkConfigWarning() {
@@ -521,7 +561,9 @@ async function saveEndpoints() {
     llm_model:     document.getElementById('model-input').value.trim(),
     llm_api_key:   document.getElementById('llm-key-input').value.trim(),
     language:      currentLang,
-    voice_en:      'Ryan',
+    tts_mode:         ttsMode,
+    voicevox_speaker: parseInt(document.getElementById('voicevox-speaker-input').value, 10) || 1,
+    voice_en:         'Ryan',
     voice_ja:      'Ono_Anna',
     voice_zh:      'Vivian',
     system_prompt_en: document.getElementById('system-prompt-en').value.trim(),
@@ -960,7 +1002,7 @@ async function enterLiveMode(preBuffer = []) {
           if (captureCtx && captureCtx.state !== 'running') captureCtx.resume()
         }
         sendAudioChunk(ev.data)
-        if (liveQueuedSrcs.length === 0) { interruptStreak = 0; return }
+        if (!livePlaybackGated && liveQueuedSrcs.length === 0) { interruptStreak = 0; return }
         const samples = new Float32Array(ev.data)
         let sum = 0
         for (const s of samples) sum += s * s
@@ -979,16 +1021,25 @@ async function enterLiveMode(preBuffer = []) {
     ws.onmessage = async (e) => {
       if (liveWS !== ws) return  // stale
       if (e.data instanceof ArrayBuffer) {
-        // WAV chunk from backend — discard if not in a TTS turn
+        // binary frame from backend — discard if not in a TTS turn
         if (!livePlaybackGated) return
+        if (liveInterruptSent) return
         try {
           const ctx = getAudioCtx()
           await ctx.resume()
-          const decoded = await ctx.decodeAudioData(e.data.slice(0))
-          // discard only if an interrupt was triggered while decoding (not on natural tts_end)
+          let audioBuffer
+          if (ttsMode === 'local') {
+            // raw float32 PCM chunk — wrap into AudioBuffer directly
+            const f32 = new Float32Array(e.data)
+            audioBuffer = ctx.createBuffer(1, f32.length, liveTtsSampleRate)
+            audioBuffer.copyToChannel(f32, 0)
+          } else {
+            // full WAV blob — decode normally
+            audioBuffer = await ctx.decodeAudioData(e.data.slice(0))
+          }
           if (liveInterruptSent) return
           const node = ctx.createBufferSource()
-          node.buffer = decoded
+          node.buffer = audioBuffer
           node.connect(ctx.destination)
           node.start()
           liveQueuedSrcs.push(node)
@@ -1015,6 +1066,7 @@ async function enterLiveMode(preBuffer = []) {
           livePlaybackGated = true
           liveInterruptSent = false
           interruptStreak = 0
+          if (msg.sample_rate) liveTtsSampleRate = msg.sample_rate
         } else if (msg.type === 'tts_end') {
           if (_liveTurnText)
             chatHistory.push({ role: 'assistant', content: _liveTurnText, source: 'voice', timestamp: Date.now() })
@@ -1058,6 +1110,14 @@ async function enterLiveMode(preBuffer = []) {
 function cancelLivePlayback() {
   for (const src of liveQueuedSrcs) { try { src.stop() } catch {} }
   liveQueuedSrcs = []
+}
+
+function liveInterrupt() {
+  if (liveInterruptSent) return
+  cancelLivePlayback()
+  liveInterruptSent = true
+  if (liveWS?.readyState === WebSocket.OPEN)
+    liveWS.send(JSON.stringify({ type: 'interrupt' }))
 }
 
 function cleanupLive() {
@@ -1138,7 +1198,11 @@ document.addEventListener('keydown', async (e) => {
   if (e.repeat) return
   if (document.getElementById('config-bar').classList.contains('open')) return
   if (state === STATE.LIVE_ACTIVE) {
-    exitLiveMode()
+    if (livePlaybackGated || liveQueuedSrcs.length > 0) {
+      liveInterrupt()   // stop TTS, signal backend, stay in live mode
+    } else {
+      exitLiveMode()
+    }
     return
   }
   if (state === STATE.PTT_PROCESSING) {

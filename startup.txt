@@ -1,3 +1,7 @@
 1. npm install       # first time only — installs Electron
 2. npm run bootstrap # first time only — creates Python venv
+source ~/.nvm/nvm.sh
 3. npm start
+
+VoiceVox Speaker ID:
+https://puarts.com/?pid=1830

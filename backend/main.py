@@ -1,6 +1,10 @@
-import asyncio, json, os, subprocess, tempfile, urllib.request
+import asyncio, json, os, subprocess, sys, tempfile, urllib.request
 from pathlib import Path
 from typing import AsyncGenerator
+
+# Ensure backend/ is on sys.path so local modules resolve when launched via
+# `python -m uvicorn backend.main:app` from the project root.
+sys.path.insert(0, str(Path(__file__).parent))
 
 import httpx
 import numpy as np
@@ -10,6 +14,8 @@ from fastapi import FastAPI, File, Form, UploadFile, WebSocket, WebSocketDisconn
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
+
+from tts_mlx import mlx_tts_stream, AVAILABLE as MLX_AVAILABLE, SAMPLE_RATE as MLX_SAMPLE_RATE
 
 # ── debug ──────────────────────────────────────────────────────────────────────
 DEBUG_RAW_SSE = False   # set True to print every raw SSE line from the LLM
@@ -54,18 +60,20 @@ def _vad_infer(samples: np.ndarray, state: np.ndarray):
 
 SETTINGS_PATH = Path(__file__).parent.parent / "data" / "settings.json"
 DEFAULT_SETTINGS = {
-    "stt_endpoint":    "",
-    "llm_endpoint":    "",
-    "tts_endpoint":    "",
-    "llm_model":       "",
-    "llm_api_key":     "",
-    "language":        "en",
-    "voice_en":        "Ryan",
-    "voice_ja":        "Ono_Anna",
-    "voice_zh":        "Vivian",
-    "system_prompt_en": "",
-    "system_prompt_ja": "",
-    "system_prompt_zh": "",
+    "stt_endpoint":      "",
+    "llm_endpoint":      "",
+    "tts_endpoint":      "",
+    "tts_mode":          "kokoro",  # "local" = MLX, "kokoro" = OpenAI-compat, "voicevox" = VOICEVOX engine
+    "voicevox_speaker":  1,
+    "llm_model":         "",
+    "llm_api_key":       "",
+    "language":          "en",
+    "voice_en":          "Ryan",
+    "voice_ja":          "Ono_Anna",
+    "voice_zh":          "Vivian",
+    "system_prompt_en":  "",
+    "system_prompt_ja":  "",
+    "system_prompt_zh":  "",
 }
 TTS_LANGUAGE_MAP = {
     "en": "English",
@@ -91,9 +99,13 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 def load_settings() -> dict:
     try:
-        return {**DEFAULT_SETTINGS, **json.loads(SETTINGS_PATH.read_text())}
+        s = {**DEFAULT_SETTINGS, **json.loads(SETTINGS_PATH.read_text())}
     except Exception:
-        return DEFAULT_SETTINGS.copy()
+        s = DEFAULT_SETTINGS.copy()
+    # normalise legacy "remote" value
+    if s.get("tts_mode") == "remote":
+        s["tts_mode"] = "kokoro"
+    return s
 
 def save_settings(s: dict):
     SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -130,15 +142,17 @@ async def get_settings():
     return load_settings()
 
 class SettingsIn(BaseModel):
-    stt_endpoint:  str = ""
-    llm_endpoint:  str = ""
-    tts_endpoint:  str = ""
-    llm_model:     str = ""
-    llm_api_key:   str = ""
-    language:      str = "en"
-    voice_en:        str = "af_heart"
-    voice_ja:        str = "jf_alpha"
-    voice_zh:        str = "zf_xiaobei"
+    stt_endpoint:     str = ""
+    llm_endpoint:     str = ""
+    tts_endpoint:     str = ""
+    tts_mode:         str = "kokoro"
+    voicevox_speaker: int = 1
+    llm_model:        str = ""
+    llm_api_key:      str = ""
+    language:         str = "en"
+    voice_en:         str = "Ryan"
+    voice_ja:         str = "Ono_Anna"
+    voice_zh:         str = "Vivian"
     system_prompt_en: str = ""
     system_prompt_ja: str = ""
     system_prompt_zh: str = ""
@@ -147,12 +161,13 @@ class SettingsIn(BaseModel):
 async def post_settings(body: SettingsIn):
     s = body.model_dump()
     save_settings(s)
+    tts_health_path = "/speakers" if s.get("tts_mode") == "voicevox" else "/health"
     status = {"stt": False, "llm": False, "tts": False}
     async with httpx.AsyncClient(timeout=3) as c:
         for key, url, path in [
             ("stt", s["stt_endpoint"], "/health"),
             ("llm", s["llm_endpoint"], "/v1/models"),
-            ("tts", s["tts_endpoint"], "/health"),
+            ("tts", s["tts_endpoint"], tts_health_path),
         ]:
             if not url: continue
             try:
@@ -210,18 +225,48 @@ class TTSIn(BaseModel):
     text: str
     language: str = "en"
 
+async def _voicevox_tts(client: httpx.AsyncClient, text: str, speaker: int, endpoint: str) -> bytes:
+    base = endpoint.rstrip("/")
+    r1 = await client.post(f"{base}/audio_query", params={"text": text, "speaker": speaker})
+    r1.raise_for_status()
+    r2 = await client.post(f"{base}/synthesis", params={"speaker": speaker}, json=r1.json())
+    r2.raise_for_status()
+    return r2.content
+
+@app.get("/tts/mlx-available")
+async def tts_mlx_available():
+    return {"available": MLX_AVAILABLE}
+
 @app.post("/tts")
 async def tts(body: TTSIn):
     s = load_settings()
-    voice = s.get(f"voice_{body.language}", s["voice_en"])
+    voice    = s.get(f"voice_{body.language}", s["voice_en"])
     tts_lang = TTS_LANGUAGE_MAP.get(body.language, "English")
+
+    if s.get("tts_mode") == "local" and MLX_AVAILABLE:
+        # collect all chunks into a single WAV for the PTT REST response
+        pcm_chunks = []
+        async for chunk in mlx_tts_stream(body.text, voice, tts_lang):
+            pcm_chunks.append(chunk)
+        samples = np.frombuffer(b"".join(pcm_chunks), dtype=np.float32)
+        import io
+        buf = io.BytesIO()
+        sf.write(buf, samples, MLX_SAMPLE_RATE, format="WAV", subtype="PCM_16")
+        buf.seek(0)
+        return Response(content=buf.read(), media_type="audio/wav")
+
     async with httpx.AsyncClient(timeout=30) as c:
-        r = await c.post(
-            s["tts_endpoint"].rstrip("/") + "/v1/audio/speech",
-            json={"model": "qwen3-tts", "input": body.text, "voice": voice, "language": tts_lang, "response_format": "wav"},
-        )
-        r.raise_for_status()
-    return Response(content=r.content, media_type="audio/wav")
+        if s.get("tts_mode") == "voicevox":
+            speaker = int(s.get("voicevox_speaker") or 1)
+            wav = await _voicevox_tts(c, body.text, speaker, s["tts_endpoint"])
+        else:  # kokoro / OpenAI-compat
+            r = await c.post(
+                s["tts_endpoint"].rstrip("/") + "/v1/audio/speech",
+                json={"model": "qwen3-tts", "input": body.text, "voice": voice, "language": tts_lang, "response_format": "wav"},
+            )
+            r.raise_for_status()
+            wav = r.content
+    return Response(content=wav, media_type="audio/wav")
 
 @app.post("/shutdown")
 async def shutdown():
@@ -298,15 +343,25 @@ async def live(ws: WebSocket):
 
             if full_text:
                 conv_messages.append({"role": "assistant", "content": full_text})
-                voice = s.get(f"voice_{s['language']}", s["voice_en"])
+                voice    = s.get(f"voice_{s['language']}", s["voice_en"])
                 tts_lang = TTS_LANGUAGE_MAP.get(s["language"], "English")
-                await send_json({"type": "tts_start"})
-                r2 = await client.post(
-                    s["tts_endpoint"].rstrip("/") + "/v1/audio/speech",
-                    json={"model": "qwen3-tts", "input": full_text, "voice": voice, "language": tts_lang, "response_format": "wav"},
-                )
-                r2.raise_for_status()
-                await ws.send_bytes(r2.content)
+                await send_json({"type": "tts_start", "sample_rate": MLX_SAMPLE_RATE if s.get("tts_mode") == "local" else 24000})
+
+                if s.get("tts_mode") == "local" and MLX_AVAILABLE:
+                    async for pcm_chunk in mlx_tts_stream(full_text, voice, tts_lang):
+                        await ws.send_bytes(pcm_chunk)
+                elif s.get("tts_mode") == "voicevox":
+                    speaker = int(s.get("voicevox_speaker") or 1)
+                    wav = await _voicevox_tts(client, full_text, speaker, s["tts_endpoint"])
+                    await ws.send_bytes(wav)
+                else:  # kokoro / OpenAI-compat
+                    r2 = await client.post(
+                        s["tts_endpoint"].rstrip("/") + "/v1/audio/speech",
+                        json={"model": "qwen3-tts", "input": full_text, "voice": voice, "language": tts_lang, "response_format": "wav"},
+                    )
+                    r2.raise_for_status()
+                    await ws.send_bytes(r2.content)
+
                 await send_json({"type": "tts_end"})
         except Exception as e:
             await send_json({"type": "error", "message": str(e)})
