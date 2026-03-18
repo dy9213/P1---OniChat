@@ -78,6 +78,7 @@ DEFAULT_SETTINGS = {
     "system_prompt_ja":  "",
     "system_prompt_zh":  "",
     "search_online":     False,
+    "translate_to":      "en",
 }
 TTS_LANGUAGE_MAP = {
     "en": "English",
@@ -229,6 +230,7 @@ class SettingsIn(BaseModel):
     system_prompt_ja: str = ""
     system_prompt_zh: str = ""
     search_online:    bool = False
+    translate_to:     str  = "en"
 
 @app.post("/settings")
 async def post_settings(body: SettingsIn):
@@ -351,10 +353,26 @@ class TTSIn(BaseModel):
     text: str
     language: str = "en"
 
+_voicevox_cancellable: bool | None = None  # None = untested, True/False = cached result
+
 async def _voicevox_tts(client: httpx.AsyncClient, text: str, speaker: int, endpoint: str) -> bytes:
+    global _voicevox_cancellable
     base = endpoint.rstrip("/")
     r1 = await client.post(f"{base}/audio_query", params={"text": text, "speaker": speaker})
     r1.raise_for_status()
+    # prefer /cancellable_synthesis — kills synthesis subprocess on connection close (<50ms interrupt)
+    # requires VOICEVOX launched with --enable_cancellable_synthesis --init_processes 2
+    # falls back to /synthesis if endpoint returns 404
+    if _voicevox_cancellable is not False:
+        r2 = await client.post(f"{base}/cancellable_synthesis", params={"speaker": speaker}, json=r1.json())
+        if r2.status_code == 404:
+            _voicevox_cancellable = False
+            print("[voicevox] /cancellable_synthesis not available — falling back to /synthesis. "
+                  "Launch VOICEVOX with --enable_cancellable_synthesis for faster interrupts.", flush=True)
+        else:
+            r2.raise_for_status()
+            _voicevox_cancellable = True
+            return r2.content
     r2 = await client.post(f"{base}/synthesis", params={"speaker": speaker}, json=r1.json())
     r2.raise_for_status()
     return r2.content
@@ -403,6 +421,33 @@ async def set_search_online(body: SearchOnlineIn):
     s["search_online"] = body.enabled
     save_settings(s)
     return {"ok": True}
+
+_TRANSLATE_LANG_NAMES = {"en": "English", "ja": "Japanese", "zh": "Chinese", "ko": "Korean", "fr": "French", "de": "German", "es": "Spanish"}
+
+class TranslateIn(BaseModel):
+    text: str
+    target: str | None = None  # overrides settings translate_to when provided
+
+@app.post("/translate")
+async def translate_text(body: TranslateIn):
+    s = load_settings()
+    target = body.target or s.get("translate_to", "en")
+    target_name = _TRANSLATE_LANG_NAMES.get(target, target)
+    system = f"Translate the following to {target_name}. Output only the translation, no explanation."
+    headers = {"Authorization": f"Bearer {s['llm_api_key']}"} if s.get("llm_api_key") else {}
+
+    async def stream() -> AsyncGenerator[bytes, None]:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(connect=10, read=30, write=10, pool=5)) as c:
+            async with c.stream("POST", s["llm_endpoint"].rstrip("/") + "/v1/chat/completions",
+                                 headers=headers,
+                                 json={"model": s.get("llm_model") or "local-model", "stream": True,
+                                       "messages": [{"role": "system", "content": system},
+                                                    {"role": "user",   "content": body.text}]}) as r:
+                async for line in r.aiter_lines():
+                    if line.startswith("data: "):
+                        yield (line + "\n\n").encode()
+
+    return StreamingResponse(stream(), media_type="text/event-stream")
 
 @app.post("/shutdown")
 async def shutdown():
