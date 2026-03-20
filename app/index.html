@@ -195,56 +195,6 @@
     outline: none;
   }
   .endpoint-row input:focus { border-color: var(--accent); }
-  #tts-mode-btn {
-    flex-shrink: 0;
-    font-size: 11px;
-    padding: 3px 8px;
-    border-radius: 5px;
-    border: 1px solid var(--border);
-    background: var(--surface2);
-    color: var(--text-dim);
-    cursor: pointer;
-    white-space: nowrap;
-  }
-  #tts-mode-btn.local {
-    border-color: var(--accent);
-    color: var(--accent);
-  }
-
-  #stt-model-select {
-    flex: 1;
-    background: var(--surface2);
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    padding: 5px 8px;
-    color: var(--text);
-    font-size: 13px;
-    outline: none;
-  }
-  #stt-load-btn {
-    flex-shrink: 0;
-    font-size: 11px;
-    padding: 3px 8px;
-    border-radius: 5px;
-    border: 1px solid var(--border);
-    background: var(--surface2);
-    color: var(--text-dim);
-    cursor: pointer;
-    white-space: nowrap;
-  }
-  #stt-load-btn:hover { color: var(--text); }
-  #stt-load-btn.loading {
-    border-color: var(--accent);
-    color: var(--accent);
-  }
-  #stt-load-status {
-    font-size: 11px;
-    color: var(--text-dim);
-    white-space: nowrap;
-  }
-  #stt-load-status.ok  { color: var(--green); }
-  #stt-load-status.err { color: var(--red); }
-
   .status-dot {
     width: 8px; height: 8px;
     border-radius: 50%;
@@ -334,7 +284,7 @@
 
   .bubble-tts-status {
     font-size: 10px;
-    color: var(--text-dim);
+    color: var(--accent);
   }
   .bubble-tts-status.interrupted {
     color: var(--accent);
@@ -346,6 +296,24 @@
     75%  { opacity: 1; }
     100% { opacity: 0; }
   }
+  .bubble-tts-status.synthesizing {
+    color: var(--accent);
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+  }
+  .bubble-tts-status.synthesizing::before {
+    content: '';
+    display: inline-block;
+    width: 7px;
+    height: 7px;
+    border: 1.5px solid currentColor;
+    border-top-color: transparent;
+    border-radius: 50%;
+    animation: tts-spin 0.65s linear infinite;
+    flex-shrink: 0;
+  }
+  @keyframes tts-spin { to { transform: rotate(360deg); } }
   .bubble-no-audio { animation: bubble-no-audio 0.45s ease; }
   @keyframes bubble-no-audio {
     0%, 100% { opacity: 1; }
@@ -871,6 +839,13 @@
       <label>System Prompt — JA</label>
       <textarea id="system-prompt-ja" class="system-prompt-input" placeholder="あなたは役立つ音声アシスタントです。日本語で簡潔に回答してください。" spellcheck="false" rows="3"></textarea>
     </div>
+    <div class="system-prompt-row" style="margin-top:10px;display:flex;align-items:center;justify-content:space-between">
+      <span id="app-version-label" style="font-size:11px;color:var(--text-dim)"></span>
+      <button id="reset-btn" onclick="resetAppData()"
+        style="font-size:11px;color:var(--text-dim);background:transparent;border:1px solid var(--border);border-radius:5px;padding:3px 10px;cursor:pointer">
+        Delete Models
+      </button>
+    </div>
   </div>
 </div>
 
@@ -901,7 +876,7 @@
     <button id="translate-btn" onclick="translateInput()" title="Translate to chat language">⇄</button>
     <button id="send-btn" onclick="sendText()">Send</button>
   </div>
-  <div id="space-hint">Hold SPACE to speak · Keep holding after speaking for live mode</div>
+  <div id="space-hint">Hold SPACEBAR to speak · Keep holding after speaking for LIVE-CHAT</div>
 </div>
 
 <div id="ctx-menu">
@@ -918,7 +893,7 @@ const PTT_VAD_ONSET_CHUNKS    = 3      // consecutive above-threshold chunks to 
 const PTT_VAD_SILENCE_CHUNKS  = 15     // consecutive below-threshold chunks to confirm speech end (~300ms)
 const INTERRUPT_RMS_THRESHOLD = 0.08
 const INTERRUPT_ONSET_CHUNKS  = 6
-const API                     = 'http://127.0.0.1:8743'
+const API                     = `http://127.0.0.1:${window.api?.backendPort ?? 8743}`
 
 // ── UI scale ────────────────────────────────────────────────────────────────────
 let uiScale = parseInt(localStorage.getItem('uiScale') || '100', 10)
@@ -948,10 +923,10 @@ let currentLang      = 'ja'
 let translateTo      = 'en'
 let ttsMode          = 'kokoro'   // 'local' | 'kokoro' | 'voicevox'
 let sttModel         = 'qwen3-0.6b-4bit'
-let sttLoadAbortCtrl = null   // AbortController for in-flight /stt/load request
 let searchOnline     = false
 let liveTtsSampleRate = 24000     // updated from tts_start event
 let chatHistory      = []
+let _hiddenSettings  = {}  // full settings blob — round-tripped for fields with no UI input
 
 // ── DOM refs ───────────────────────────────────────────────────────────────────
 const chatList  = document.getElementById('chat-list')
@@ -964,32 +939,35 @@ const arcTrack  = document.getElementById('arc-track')
 // ── settings ───────────────────────────────────────────────────────────────────
 async function loadSettings() {
   try {
-    const s = await window.api.getSettings()
-    document.getElementById('stt-input').value           = s.stt_endpoint   || ''
-    document.getElementById('llm-input').value           = s.llm_endpoint   || ''
-    document.getElementById('tts-input').value           = s.tts_endpoint   || ''
-    document.getElementById('model-input').value         = s.llm_model      || ''
-    document.getElementById('llm-key-input').value       = s.llm_api_key    || ''
-    document.getElementById('system-prompt-en').value = s.system_prompt_en || ''
+    const s = await fetch(`${API}/settings`).then(r => r.json())
+    _hiddenSettings = s
     document.getElementById('system-prompt-ja').value = s.system_prompt_ja || ''
-    document.getElementById('system-prompt-zh').value = s.system_prompt_zh || ''
-    currentLang = s.language || 'ja'
-    translateTo = s.translate_to || 'en'
-    ttsMode = (s.tts_mode === 'remote' ? 'kokoro' : s.tts_mode) || 'kokoro'
-    sttModel = s.stt_model || 'qwen3-0.6b-4bit'
+    currentLang  = s.language    || 'ja'
+    translateTo  = s.translate_to || 'en'
+    ttsMode      = (s.tts_mode === 'remote' ? 'kokoro' : s.tts_mode) || 'kokoro'
+    sttModel     = s.stt_model   || 'qwen3-0.6b-4bit'
     searchOnline = !!s.search_online
     updateOnlineUI()
-    updateTranslateToUI()
-    document.getElementById('voicevox-speaker-input').value = s.voicevox_speaker ?? 1
-    updateLangUI()
-    updateTtsModeUI()
-    await loadSttModels()
-    checkConfigWarning()
-  } catch {}
+  } catch (e) { console.error('[loadSettings]', e) }
 }
 
 function toggleConfig() {
   document.getElementById('config-bar').classList.toggle('open')
+}
+
+// ── Version + reset ───────────────────────────────────────────────────────────
+if (window.api?.getVersion) {
+  window.api.getVersion().then(v => {
+    const el = document.getElementById('app-version-label')
+    if (el) el.textContent = `OniChat v${v}`
+  })
+}
+
+function resetAppData() {
+  if (!confirm('This will delete all downloaded models, the Python environment, and settings, then quit the app.\n\nContinue?')) return
+  if (window.api?.resetAppData) {
+    window.api.resetAppData()
+  }
 }
 
 function toggleKeysPopup() {
@@ -1020,149 +998,20 @@ function setLang(lang) {
   updateLangUI()
 }
 
-function updateLangUI() {
-  document.getElementById('lang-en').classList.toggle('active', currentLang === 'en')
-  document.getElementById('lang-ja').classList.toggle('active', currentLang === 'ja')
-  document.getElementById('lang-zh').classList.toggle('active', currentLang === 'zh')
-}
-
-function setTranslateTo(lang) {
-  translateTo = lang
-  updateTranslateToUI()
-}
-
-function updateTranslateToUI() {
-  document.getElementById('trans-en').classList.toggle('active', translateTo === 'en')
-  document.getElementById('trans-ja').classList.toggle('active', translateTo === 'ja')
-  document.getElementById('trans-zh').classList.toggle('active', translateTo === 'zh')
-}
-
-function toggleTtsMode() {
-  const cycle = { 'local': 'kokoro', 'kokoro': 'voicevox', 'voicevox': 'local' }
-  ttsMode = cycle[ttsMode] || 'kokoro'
-  updateTtsModeUI()
-}
-
-function updateTtsModeUI() {
-  const btn = document.getElementById('tts-mode-btn')
-  const labels = { 'local': 'Local', 'kokoro': 'Kokoro', 'voicevox': 'VoiceVox' }
-  btn.textContent = labels[ttsMode] || 'Kokoro'
-  btn.classList.toggle('local', ttsMode === 'local')
-  document.getElementById('voicevox-speaker-row').style.display = ttsMode === 'voicevox' ? '' : 'none'
-}
-
-function checkConfigWarning() {
-  const sttOk = sttModel !== 'remote' || !!document.getElementById('stt-input').value
-  const empty = !sttOk ||
-                !document.getElementById('llm-input').value ||
-                !document.getElementById('tts-input').value
-  document.getElementById('config-warning').style.display = empty ? '' : 'none'
-  if (empty && !document.getElementById('config-bar').classList.contains('open')) {
-    document.getElementById('config-bar').classList.add('open')
-  }
-}
-
-async function loadSttModels() {
-  try {
-    const models = await fetch(`${API}/stt/models`).then(r => r.json())
-    const sel = document.getElementById('stt-model-select')
-    sel.innerHTML = ''
-    for (const m of models) {
-      const opt = document.createElement('option')
-      opt.value = m.key
-      opt.textContent = m.label + (m.loaded ? ' ✓' : '') + (!m.available && m.key !== 'remote' ? ' (unavailable)' : '')
-      opt.disabled = !m.available
-      sel.appendChild(opt)
-    }
-    sel.value = sttModel
-    updateSttEndpointRowVisibility()
-  } catch {}
-}
-
-function onSttModelChange() {
-  sttModel = document.getElementById('stt-model-select').value
-  updateSttEndpointRowVisibility()
-  checkConfigWarning()
-  document.getElementById('stt-load-status').textContent = ''
-  document.getElementById('stt-load-status').className = ''
-}
-
-function updateSttEndpointRowVisibility() {
-  document.getElementById('stt-endpoint-row').style.display = sttModel === 'remote' ? '' : 'none'
-}
-
-async function loadSttModel() {
-  const key = document.getElementById('stt-model-select').value
-  if (key === 'remote') return
-  const btn    = document.getElementById('stt-load-btn')
-  const status = document.getElementById('stt-load-status')
-
-  if (btn.classList.contains('loading')) {
-    // Cancel in-flight load
-    sttLoadAbortCtrl?.abort()
-    await fetch(`${API}/stt/load/cancel`, { method: 'POST' }).catch(() => {})
-    btn.textContent = 'Load'
-    btn.classList.remove('loading')
-    status.textContent = 'Cancelled'
-    status.className = ''
-    return
-  }
-
-  btn.textContent = 'Cancel'
-  btn.classList.add('loading')
-  status.textContent = 'Loading…'
-  status.className = ''
-  sttLoadAbortCtrl = new AbortController()
-  try {
-    const r = await fetch(`${API}/stt/load`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: key }),
-      signal: sttLoadAbortCtrl.signal,
-    })
-    const data = await r.json()
-    if (data.cancelled) {
-      status.textContent = 'Cancelled'
-      status.className = ''
-    } else if (data.ok) {
-      status.textContent = `✓ ${data.elapsed_ms}ms`
-      status.className = 'ok'
-      loadSttModels()  // refresh loaded state in select
-    } else {
-      status.textContent = data.error || 'Error'
-      status.className = 'err'
-    }
-  } catch (e) {
-    if (e.name !== 'AbortError') {
-      status.textContent = 'Error'
-      status.className = 'err'
-    }
-  } finally {
-    btn.textContent = 'Load'
-    btn.classList.remove('loading')
-    sttLoadAbortCtrl = null
-  }
-}
+function updateLangUI() {}
+function updateTranslateToUI() {}
+function updateTtsModeUI() {}
+function checkConfigWarning() {}
 
 async function saveEndpoints() {
   const s = {
-    stt_endpoint:  document.getElementById('stt-input').value.trim(),
-    stt_model:     sttModel,
-    search_online: searchOnline,
-    llm_endpoint:  document.getElementById('llm-input').value.trim(),
-    tts_endpoint:  document.getElementById('tts-input').value.trim(),
-    llm_model:     document.getElementById('model-input').value.trim(),
-    llm_api_key:   document.getElementById('llm-key-input').value.trim(),
-    language:      currentLang,
-    translate_to:  translateTo,
+    ..._hiddenSettings,
+    language:         currentLang,
+    translate_to:     translateTo,
     tts_mode:         ttsMode,
-    voicevox_speaker: parseInt(document.getElementById('voicevox-speaker-input').value, 10) || 1,
-    voice_en:         'Ryan',
-    voice_ja:      'Ono_Anna',
-    voice_zh:      'Vivian',
-    system_prompt_en: document.getElementById('system-prompt-en').value.trim(),
+    stt_model:        sttModel,
+    search_online:    searchOnline,
     system_prompt_ja: document.getElementById('system-prompt-ja').value.trim(),
-    system_prompt_zh: document.getElementById('system-prompt-zh').value.trim(),
   }
   document.getElementById('save-status').textContent = 'Saving…'
   try {
@@ -1181,7 +1030,7 @@ async function saveEndpoints() {
 
 function setDot(key, ok) {
   const d = document.getElementById(`dot-${key}`)
-  d.className = 'status-dot ' + (ok === true ? 'ok' : ok === false ? 'err' : '')
+  if (d) d.className = 'status-dot ' + (ok === true ? 'ok' : ok === false ? 'err' : '')
 }
 
 // ── chat ───────────────────────────────────────────────────────────────────────
@@ -1468,6 +1317,7 @@ async function translateInput() {
 }
 
 async function sendText() {
+  if (ttsFetchController) return  // synthesis in-flight — wait for audio to be ready
   const text = textInput.value.trim()
   if (!text) return
   textInput.value = ''
@@ -1585,6 +1435,7 @@ function getAudioCtx() {
 }
 
 let pttAudioSrc = null
+let ttsFetchController = null   // non-null = TTS synthesis fetch in-flight (spacebar locked)
 
 function stopPTTAudio() {
   if (pttAudioSrc) {
@@ -1596,10 +1447,19 @@ function stopPTTAudio() {
 }
 
 async function fetchAndPlayTTS(text, targetWrap = null) {
-  const r = await fetch(`${API}/tts`, {
-    method: 'POST', headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({ text, language: currentLang }),
-  })
+  _ttsActiveBubbleWrap = targetWrap ?? chatList.querySelector('.bubble-wrap.assistant:last-child') ?? null
+  ttsFetchController = new AbortController()
+  setBubbleTtsStatus(_ttsActiveBubbleWrap, 'synthesizing')
+  let r
+  try {
+    r = await fetch(`${API}/tts`, {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ text, language: currentLang }),
+      signal: ttsFetchController.signal,
+    })
+  } finally {
+    ttsFetchController = null
+  }
   if (!r.ok) throw new Error(`TTS error ${r.status}`)
   const buf = await r.arrayBuffer()
   const ctx = getAudioCtx()
@@ -1608,7 +1468,6 @@ async function fetchAndPlayTTS(text, targetWrap = null) {
   src.buffer = decoded
   src.connect(ctx.destination)
   pttAudioSrc = src
-  _ttsActiveBubbleWrap = targetWrap ?? chatList.querySelector('.bubble-wrap.assistant:last-child') ?? null
   setBubbleTtsStatus(_ttsActiveBubbleWrap, 'playback')
   src.start()
   return new Promise((res) => { src.onended = () => { pttAudioSrc = null; setBubbleTtsStatus(_ttsActiveBubbleWrap, null); _ttsActiveBubbleWrap = null; res() } })
@@ -1744,9 +1603,14 @@ function setBubbleTtsStatus(wrapEl, mode) {
   }
   const span = document.createElement('span')
   span.className = 'bubble-tts-status'
-  span.textContent = mode === 'playback' ? '▶ playback' : '✕ interrupted'
-  if (mode === 'interrupted') {
+  if (mode === 'synthesizing') {
+    span.classList.add('synthesizing')
+    span.textContent = 'Processing'
+  } else if (mode === 'playback') {
+    span.textContent = '▶ playback'
+  } else {
     span.classList.add('interrupted')
+    span.textContent = '✕ interrupted'
     setTimeout(() => span.remove(), 800)
   }
   // user bubbles: insert before the timestamp (status appears to its left)
@@ -1852,7 +1716,7 @@ async function enterLiveMode(preBuffer = []) {
     // captureStream/captureCtx/captureWorklet are already running from startCapture()
     console.log(`[live] enterLiveMode captureWorklet=${!!captureWorklet} captureCtx=${!!captureCtx} captureStream=${!!captureStream} preBuffer=${preBuffer.length}`)
 
-    liveWS = new WebSocket(`ws://127.0.0.1:8743/live`)
+    liveWS = new WebSocket(`ws://127.0.0.1:${window.api?.backendPort ?? 8743}/live`)
     liveWS.binaryType = 'arraybuffer'
     const ws = liveWS  // snapshot — guards stale callbacks if liveWS is replaced before close
 
@@ -2224,6 +2088,7 @@ document.addEventListener('keydown', async (e) => {
     return
   }
   if (state === STATE.PTT_PROCESSING) {
+    if (ttsFetchController) return  // synthesis in-flight — spacebar locked until audio ready
     // ── interrupt decision tree ──────────────────────────────────
     // abortLLM()    → no-op if LLM already done; cancels stream if still generating
     // stopPTTAudio() → no-op if audio not playing; stops audio + shows badge if playing
@@ -2240,6 +2105,7 @@ document.addEventListener('keydown', async (e) => {
     return
   }
   if (state !== STATE.IDLE) return
+  if (ttsFetchController) return   // synthesis in-flight from arrow-key replay — spacebar locked
   if (pttAudioSrc) { stopPTTAudio(); return }  // stop arrow-key TTS replay
   if (!isPTTEligible()) return
 
@@ -2319,7 +2185,7 @@ document.getElementById('ctx-reply').addEventListener('click', () => {
 document.getElementById('ctx-ask').addEventListener('click', () => {
   const prompt = `「${_ctxSelection}」とっ意味てすか`
   hideCtxMenu()
-  if (state !== STATE.IDLE) return
+  if (state !== STATE.IDLE || ttsFetchController) return
   textInput.value = ''
   appendUserMessage(prompt, 'text')
   document.getElementById('send-btn').disabled = true

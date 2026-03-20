@@ -431,7 +431,7 @@
   <div class="header">
     <div class="header-icon">🍙</div>
     <div>
-      <div class="header-title">OniChat</div>
+      <div class="header-title">OniChat <span id="app-version" style="font-size:13px;font-weight:400;color:var(--muted)"></span></div>
       <div class="header-sub" id="header-sub">Checking installation…</div>
     </div>
   </div>
@@ -567,7 +567,7 @@
 </div>
 
 <script>
-const API = 'http://127.0.0.1:8743'
+const API = `http://127.0.0.1:${window.api?.backendPort ?? 8743}`
 const OS_OVERHEAD_GB = 0
 
 let _sysInfo   = null
@@ -1056,8 +1056,13 @@ async function doDownloads(needed) {
     }
   }
 
+  const prevStt = document.getElementById('sel-stt').value
+  const prevTts = document.getElementById('sel-tts').value
+  const prevLlm = document.getElementById('sel-llm').value
   repopulatePresence()
-  restoreSelections(_settings)   // re-select same keys after repopulate
+  document.getElementById('sel-stt').value = prevStt
+  document.getElementById('sel-tts').value = prevTts
+  document.getElementById('sel-llm').value = prevLlm
   area.style.display  = 'none'
   btn.disabled        = false
   btn.textContent     = 'Launch'
@@ -1176,6 +1181,11 @@ if (window.api?.onLog) {
 }
 
 // ── Boot ──────────────────────────────────────────────────────────────────────
+if (window.api?.getVersion) {
+  window.api.getVersion().then(v => {
+    document.getElementById('app-version').textContent = `v${v}`
+  })
+}
 checkInstall()
 </script>
 </body>

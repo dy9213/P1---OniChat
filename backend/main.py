@@ -1,5 +1,9 @@
-import asyncio, json, os, subprocess, sys, tempfile, urllib.request
+import asyncio, json, os, sys, tempfile, urllib.request
 from pathlib import Path
+
+# ── production path roots (set by Electron, fall back to dev layout) ──────────
+APP_ROOT  = Path(os.environ.get("ONICHAT_APP_ROOT",  Path(__file__).parent.parent))
+USER_DATA = Path(os.environ.get("ONICHAT_USER_DATA", Path(__file__).parent.parent))
 from typing import AsyncGenerator
 
 # Add project root to sys.path so `modules/` package is importable regardless of CWD.
@@ -61,14 +65,14 @@ def _vad_infer(samples: np.ndarray, state: np.ndarray):
     })
     return float(out[0][0][0]), out[1]
 
-SETTINGS_PATH = Path(__file__).parent.parent / "data" / "settings.json"
+SETTINGS_PATH = USER_DATA / "data" / "settings.json"
 DEFAULT_SETTINGS = {
     "stt_endpoint":      "",
     "stt_model":         "qwen3-1.7b-4bit",
     "llm_endpoint":      "",
     "tts_endpoint":      "",
     "tts_mode":          "voicevox",
-    "voicevox_speaker":  1,
+    "voicevox_speaker":  2,
     "llm_model":         "",
     "llm_api_key":       "",
     "language":          "ja",
@@ -76,7 +80,7 @@ DEFAULT_SETTINGS = {
     "voice_ja":          "Ono_Anna",
     "voice_zh":          "Vivian",
     "system_prompt_en":  "",
-    "system_prompt_ja":  "",
+    "system_prompt_ja":  "あなたは日本語の会話相手です。返信は短くしましょう。出力はテキスト読み上げ用です。",
     "system_prompt_zh":  "",
     "search_online":     False,
     "translate_to":      "en",
@@ -197,18 +201,28 @@ def save_settings(s: dict):
 
 # ── helpers ────────────────────────────────────────────────────────────────────
 def webm_to_wav(data: bytes) -> bytes:
+    """Decode webm/any audio bytes → 16 kHz mono WAV bytes via soundfile + scipy."""
+    import io
+    from scipy.signal import resample_poly
+    from math import gcd
     with tempfile.NamedTemporaryFile(suffix=".webm", delete=False) as src:
         src.write(data); src_path = src.name
-    dst_path = src_path.replace(".webm", ".wav")
     try:
-        subprocess.run(
-            ["ffmpeg", "-y", "-i", src_path, "-ar", "16000", "-ac", "1", dst_path],
-            check=True, capture_output=True,
-        )
-        return Path(dst_path).read_bytes()
+        audio, sr = sf.read(src_path, always_2d=True)
+        # Mix down to mono
+        if audio.shape[1] > 1:
+            audio = audio.mean(axis=1, keepdims=True)
+        audio = audio[:, 0]
+        # Resample to 16 kHz if needed
+        target_sr = 16000
+        if sr != target_sr:
+            g = gcd(target_sr, sr)
+            audio = resample_poly(audio, target_sr // g, sr // g).astype("float32")
+        buf = io.BytesIO()
+        sf.write(buf, audio, target_sr, format="WAV", subtype="PCM_16")
+        return buf.getvalue()
     finally:
         os.unlink(src_path)
-        if os.path.exists(dst_path): os.unlink(dst_path)
 
 def pcm_to_wav(pcm: bytes, sample_rate: int = SAMPLE_RATE) -> bytes:
     samples = np.frombuffer(pcm, dtype=np.float32)
@@ -416,6 +430,24 @@ async def voicevox_start():
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.post("/voicevox/warmup")
+async def voicevox_warmup():
+    """Synthesise a short silent phrase to force speaker 2 weights into RAM."""
+    s = load_settings()
+    speaker = int(s.get("voicevox_speaker") or 2)
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            q = await client.post(f"{voicevox_manager.endpoint}/audio_query",
+                                  params={"text": "。", "speaker": speaker})
+            if q.status_code == 200:
+                await client.post(f"{voicevox_manager.endpoint}/synthesis",
+                                  params={"speaker": speaker},
+                                  content=q.content,
+                                  headers={"Content-Type": "application/json"})
+        return {"ok": True}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
 @app.get("/settings")
 async def get_settings():
     return load_settings()
@@ -426,7 +458,7 @@ class SettingsIn(BaseModel):
     llm_endpoint:     str = ""
     tts_endpoint:     str = ""
     tts_mode:         str = "kokoro"
-    voicevox_speaker: int = 1
+    voicevox_speaker: int = 2
     llm_model:        str = ""
     llm_api_key:      str = ""
     language:         str = "ja"
@@ -617,7 +649,7 @@ async def tts(body: TTSIn):
 
     async with httpx.AsyncClient(timeout=30) as c:
         if s.get("tts_mode") == "voicevox":
-            speaker = int(s.get("voicevox_speaker") or 1)
+            speaker = int(s.get("voicevox_speaker") or 2)
             wav = await _voicevox_tts(c, body.text, speaker, _voicevox_endpoint(s))
         else:  # kokoro / OpenAI-compat
             r = await c.post(
@@ -773,7 +805,7 @@ async def live(ws: WebSocket):
                 await send_json({"type": "tts_start", "sample_rate": 24000})
 
                 if s.get("tts_mode") == "voicevox":
-                    speaker = int(s.get("voicevox_speaker") or 1)
+                    speaker = int(s.get("voicevox_speaker") or 2)
                     wav = await _voicevox_tts(client, full_text, speaker, _voicevox_endpoint(s))
                     await ws.send_bytes(wav)
                 else:  # kokoro / OpenAI-compat

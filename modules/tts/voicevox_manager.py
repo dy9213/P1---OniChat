@@ -3,11 +3,12 @@ Manage a voicevox_engine subprocess for local Japanese TTS.
 Binary:  modules/tts/bin/run  (VOICEVOX Engine release binary)
 Port:    50021 (VOICEVOX default, loopback only)
 """
-import os, subprocess, time, urllib.request
+import os, subprocess, threading, time, urllib.request
 from pathlib import Path
 from typing import Optional
 
-BIN_DIR       = Path(__file__).parent / "bin"
+_USER_DATA    = Path(os.environ.get("ONICHAT_USER_DATA", Path(__file__).parent.parent.parent))
+BIN_DIR       = _USER_DATA / "modules" / "tts" / "bin"
 VOICEVOX_PORT = 50021
 VOICEVOX_URL  = f"http://127.0.0.1:{VOICEVOX_PORT}"
 
@@ -46,9 +47,13 @@ class VoicevoxManager:
         return VOICEVOX_URL
 
     def start(self) -> None:
-        """Start voicevox_engine. Blocks until /speakers returns 200 (≤60 s)."""
+        """Start voicevox_engine. Blocks until /speakers returns 200 (≤60 s).
+        If already running but not owned by this manager, restart so the
+        --enable_cancellable_synthesis flag is guaranteed to be active."""
         if self.is_running():
-            return
+            if self._proc is not None:
+                return  # we own it and it's running — already started with correct flags
+            self.stop()  # orphan from a previous session — kill and restart
 
         binary = _find_binary()
         if binary is None:
@@ -56,12 +61,30 @@ class VoicevoxManager:
                 "voicevox_engine binary not found — run the installer first"
             )
 
+        def _boost_priority():
+            """Raise VOICEVOX process nice value so inference isn't starved by
+            lower-QoS process tree inherited from launchd / Finder launch."""
+            try:
+                os.setpriority(os.PRIO_PROCESS, 0, -5)
+            except Exception:
+                pass
+
         self._proc = subprocess.Popen(
             [str(binary), "--host", "127.0.0.1", "--port", str(VOICEVOX_PORT)],
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
             cwd=BIN_DIR,   # engine expects to run from its own directory
+            preexec_fn=_boost_priority,
         )
+
+        # Forward VOICEVOX stderr to backend stdout for console diagnostics
+        def _pipe_stderr(proc):
+            for raw in proc.stderr:
+                line = raw.decode(errors="replace").rstrip()
+                if line:
+                    print(f"[voicevox_engine] {line}", flush=True)
+
+        threading.Thread(target=_pipe_stderr, args=(self._proc,), daemon=True).start()
 
         deadline = time.monotonic() + 60
         while time.monotonic() < deadline:
@@ -85,6 +108,21 @@ class VoicevoxManager:
                 self._proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 self._proc.kill()
+        else:
+            # No owned process — kill any orphan holding the port
+            try:
+                import signal
+                result = subprocess.run(
+                    ["lsof", "-ti", f":{VOICEVOX_PORT}"],
+                    capture_output=True, text=True,
+                )
+                for pid in result.stdout.strip().split():
+                    try:
+                        os.kill(int(pid), signal.SIGKILL)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
         self._proc = None
 
     def restart(self) -> None:

@@ -5,11 +5,18 @@ import hashlib, io, json, os, shutil, socket, stat, tarfile, time, urllib.reques
 from pathlib import Path
 from typing import Callable, Optional
 
-BIN_DIR    = Path(__file__).parent / "bin"
+_USER_DATA = Path(os.environ.get("ONICHAT_USER_DATA", Path(__file__).parent.parent.parent))
+BIN_DIR    = _USER_DATA / "modules" / "llm" / "bin"
 LLAMA_BIN  = BIN_DIR / "llama-server"
 GITHUB_API = "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest"
 
 ProgressCb = Callable[[int, str], None]
+
+# Only keep files needed to run llama-server; skip bench tools, quantizers, etc.
+def _keep_file(name: str) -> bool:
+    if name.endswith(".dylib") or name.endswith(".metallib"):
+        return True
+    return name in {"llama-server", "llama-completion", "LICENSE"}
 
 
 def is_installed() -> bool:
@@ -145,6 +152,11 @@ def install(progress: Optional[ProgressCb] = None) -> None:
 
         if not (tmp_dir / "llama-server").exists():
             raise RuntimeError("llama-server binary not found in archive after extraction")
+
+        # Remove files we don't need (bench tools, quantizers, etc.)
+        for f in list(tmp_dir.iterdir()):
+            if f.is_file() and not _keep_file(f.name):
+                f.unlink()
 
         report(95, "Installing…")
         for f in tmp_dir.iterdir():

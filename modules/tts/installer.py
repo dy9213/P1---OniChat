@@ -6,12 +6,18 @@ import hashlib, io, json, os, shutil, socket, stat, subprocess, tarfile, time, u
 from pathlib import Path
 from typing import Callable, Optional
 
-BIN_DIR    = Path(__file__).parent / "bin"
+_USER_DATA = Path(os.environ.get("ONICHAT_USER_DATA", Path(__file__).parent.parent.parent))
+BIN_DIR    = _USER_DATA / "modules" / "tts" / "bin"
 GITHUB_API = "https://api.github.com/repos/VOICEVOX/voicevox_engine/releases/latest"
 
 ProgressCb = Callable[[int, str], None]
 
 _BIN_CANDIDATES = ["run", "voicevox_engine", "main"]
+
+# Only retain .vvm model files needed for speaker 2 (四国めたん ノーマル).
+# Speaker styles 0-3 belong to the first two characters; keep .vvm 0, 1, 2
+# which covers all styles of those characters (~168 MB vs 1.5 GB full set).
+_KEEP_VVM = {0, 1, 2}
 
 
 def is_installed() -> bool:
@@ -181,6 +187,18 @@ def install(progress: Optional[ProgressCb] = None) -> None:
                 f"Expected one of {_BIN_CANDIDATES}. Found: {contents}"
             )
 
+        # Prune unused speaker models before committing to BIN_DIR.
+        # Keep only .vvm files in _KEEP_VVM; delete the rest to save ~1.3 GB.
+        model_dir = tmp_dir / "model"
+        if model_dir.is_dir():
+            for vvm in list(model_dir.glob("*.vvm")):
+                try:
+                    idx = int(vvm.stem)
+                except ValueError:
+                    continue
+                if idx not in _KEEP_VVM:
+                    vvm.unlink()
+
         report(95, "Installing…")
         for f in tmp_dir.iterdir():
             dest = BIN_DIR / f.name
@@ -192,5 +210,15 @@ def install(progress: Optional[ProgressCb] = None) -> None:
         raise
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    # Remove macOS quarantine attribute — prevents Gatekeeper validation overhead
+    # on every subprocess launch of the engine binary.
+    try:
+        subprocess.run(
+            ["xattr", "-dr", "com.apple.quarantine", str(BIN_DIR)],
+            capture_output=True,
+        )
+    except Exception:
+        pass
 
     report(100, f"Installed VOICEVOX Engine {tag}")

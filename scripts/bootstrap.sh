@@ -1,37 +1,44 @@
 #!/bin/bash
 set -e
 
-# Requires Python 3.10+ and ffmpeg installed via Homebrew:
-#   brew install ffmpeg
-# Uses whatever python3 is available (3.10+ is fine)
-# Note: Silero VAD model (~2MB) is downloaded automatically on first app start.
+# Usage: bootstrap.sh [venv-destination]
+#   venv-destination defaults to ./venv (dev mode)
+#
+# In production, Electron passes:
+#   $1              = path to venv in userData
+#   ONICHAT_UV      = path to bundled uv binary
+#   ONICHAT_APP_ROOT = read-only app bundle root (cwd is set to this)
 
-PYTHON=$(which python3.12 2>/dev/null || which python3.11 2>/dev/null || which python3.10 2>/dev/null || which python3 2>/dev/null || echo "")
-if [ -z "$PYTHON" ]; then
-  echo "Error: python3 not found."
-  exit 1
-fi
+VENV_DIR="${1:-$(pwd)/venv}"
 
-if ! command -v ffmpeg &>/dev/null; then
-  echo "Error: ffmpeg not found. Run: brew install ffmpeg"
-  exit 1
-fi
-
-$PYTHON -m venv venv
-source venv/bin/activate
-pip install --upgrade pip
-pip install -r backend/requirements.txt
-pip install duckduckgo-search
-
-# Install mlx-audio on Apple Silicon only
-ARCH=$(uname -m)
-if [ "$ARCH" = "arm64" ] && [[ "$(uname -s)" == "Darwin" ]]; then
-  echo "Apple Silicon detected — installing mlx-audio and mlx-whisper for local TTS/STT…"
-  pip install mlx-audio
-  pip install mlx-whisper
+# ── Python / venv setup ───────────────────────────────────────────────────────
+# Prefer bundled uv (production), fall back to system uv, then system python3
+if [ -n "$ONICHAT_UV" ] && [ -x "$ONICHAT_UV" ]; then
+  UV="$ONICHAT_UV"
+  echo "Using bundled uv: $UV"
+elif command -v uv &>/dev/null; then
+  UV="$(which uv)"
+  echo "Using system uv: $UV"
 else
-  echo "Skipping mlx-audio / mlx-whisper (Apple Silicon only)"
+  UV=""
 fi
 
-mkdir -p data
-echo "Bootstrap complete. Run: npm start"
+if [ -n "$UV" ]; then
+  "$UV" venv --python 3.12 "$VENV_DIR"
+  "$UV" pip install --python "$VENV_DIR/bin/python" -r backend/requirements.txt
+  "$UV" pip install --python "$VENV_DIR/bin/python" mlx-audio
+else
+  PYTHON=$(which python3.12 2>/dev/null || which python3.11 2>/dev/null || which python3.10 2>/dev/null || which python3 2>/dev/null || echo "")
+  if [ -z "$PYTHON" ]; then
+    echo "Error: python3 not found and uv is not available."
+    exit 1
+  fi
+  echo "Using system python: $PYTHON"
+  "$PYTHON" -m venv "$VENV_DIR"
+  "$VENV_DIR/bin/pip" install --upgrade pip
+  "$VENV_DIR/bin/pip" install -r backend/requirements.txt
+  "$VENV_DIR/bin/pip" install mlx-audio
+fi
+
+mkdir -p "$(dirname "$VENV_DIR")/data"
+echo "Bootstrap complete."

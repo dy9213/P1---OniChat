@@ -8,8 +8,9 @@ import hashlib, json, os, socket, subprocess, time, urllib.request
 from pathlib import Path
 from typing import Callable, Optional
 
-BIN_DIR    = Path(__file__).parent / "bin"
-MODELS_DIR = Path(__file__).parent / "models"
+_USER_DATA = Path(os.environ.get("ONICHAT_USER_DATA", Path(__file__).parent.parent.parent))
+BIN_DIR    = _USER_DATA / "modules" / "llm" / "bin"
+MODELS_DIR = _USER_DATA / "modules" / "llm" / "models"
 LLAMA_BIN  = BIN_DIR / "llama-server"
 LLAMA_PORT = 8745
 LLAMA_URL  = f"http://127.0.0.1:{LLAMA_PORT}"
@@ -37,7 +38,14 @@ class LlmManager:
     # ── queries ───────────────────────────────────────────────────────────────
 
     def is_running(self) -> bool:
-        return self._proc is not None and self._proc.poll() is None
+        if self._proc is not None and self._proc.poll() is None:
+            return True
+        # Fallback: poll the health endpoint — catches orphaned processes after backend restart
+        try:
+            with urllib.request.urlopen(f"{LLAMA_URL}/health", timeout=1) as r:
+                return r.status == 200
+        except Exception:
+            return False
 
     def model_path(self, key: str) -> Optional[Path]:
         fname = MODEL_FILES.get(key)
@@ -111,6 +119,19 @@ class LlmManager:
             except subprocess.TimeoutExpired:
                 self._proc.kill()
         self._proc = None
+        # Kill any orphaned llama-server still holding the port
+        try:
+            result = subprocess.run(
+                ["lsof", "-ti", f"tcp:{LLAMA_PORT}"],
+                capture_output=True, text=True
+            )
+            for pid in result.stdout.strip().splitlines():
+                try:
+                    os.kill(int(pid), 9)
+                except Exception:
+                    pass
+        except Exception:
+            pass
         self._active_key = None
 
     # ── model download ────────────────────────────────────────────────────────

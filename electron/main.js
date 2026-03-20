@@ -4,10 +4,18 @@ const fs     = require('fs')
 const http   = require('http')
 const { spawn } = require('child_process')
 
-const ROOT          = path.join(__dirname, '..')
-const VENV_PYTHON   = path.join(ROOT, 'venv', 'bin', 'python')
-const SETTINGS_PATH = path.join(ROOT, 'data', 'settings.json')
-const BACKEND_PORT  = 8743
+// ── path roots ────────────────────────────────────────────────────────────────
+// APP_ROOT  — read-only bundle root (source code, scripts)
+// USER_DATA — writable runtime dir (venv, settings, downloaded binaries)
+//
+// Dev:  both point to the project root
+// Prod: APP_ROOT = .app/Contents/Resources/app, USER_DATA = ~/Library/Application Support/OniChat
+const APP_ROOT  = app.isPackaged ? path.join(process.resourcesPath, 'app') : path.join(__dirname, '..')
+const USER_DATA = app.isPackaged ? app.getPath('userData') : path.join(__dirname, '..')
+
+const VENV_PYTHON   = path.join(USER_DATA, 'venv', 'bin', 'python')
+const SETTINGS_PATH = path.join(USER_DATA, 'data', 'settings.json')
+const BACKEND_PORT  = app.isPackaged ? 8744 : 8743
 const HEALTH_URL    = `http://127.0.0.1:${BACKEND_PORT}/health`
 
 let mainWindow  = null
@@ -29,7 +37,19 @@ function pushLog(level, raw) {
   })
 }
 
-ipcMain.handle('get-log-history', () => [...logBuffer])
+ipcMain.handle('get-backend-port',   () => BACKEND_PORT)
+ipcMain.on('get-backend-port-sync', (e) => { e.returnValue = BACKEND_PORT })
+ipcMain.handle('get-log-history',  () => [...logBuffer])
+ipcMain.handle('get-version',     () => require(path.join(__dirname, '..', 'package.json')).version)
+
+ipcMain.handle('reset-app-data', async () => {
+  if (!app.isPackaged) { console.warn('reset-app-data blocked in dev mode'); return }
+  try { await fetch(`http://127.0.0.1:${BACKEND_PORT}/shutdown`, { method: 'POST' }) } catch {}
+  await new Promise(r => setTimeout(r, 1000))
+  try { process.kill(-backendProc.pid, 'SIGTERM') } catch {}
+  fs.rmSync(USER_DATA, { recursive: true, force: true })
+  app.quit()
+})
 
 // ── settings IPC ──────────────────────────────────────────────────────────────
 ipcMain.handle('get-settings', () => {
@@ -54,10 +74,43 @@ function pollHealth(resolve, reject, attempts = 0) {
 // ── bootstrap ─────────────────────────────────────────────────────────────────
 function runBootstrap() {
   return new Promise((resolve, reject) => {
-    const proc = spawn('bash', [path.join(ROOT, 'scripts', 'bootstrap.sh')], {
-      cwd: ROOT, stdio: 'inherit',
+    const venvDest = path.join(USER_DATA, 'venv')
+    const proc = spawn('bash', [path.join(APP_ROOT, 'scripts', 'bootstrap.sh'), venvDest], {
+      cwd: APP_ROOT,
+      stdio: 'inherit',
+      env: { ...process.env, ONICHAT_UV: path.join(APP_ROOT, 'scripts', 'bin', 'uv') },
     })
     proc.on('close', (code) => code === 0 ? resolve() : reject(new Error(`Bootstrap failed (${code})`)))
+  })
+}
+
+// ── kill any stale process holding the backend port ───────────────────────────
+function killPortOwner(port) {
+  return new Promise((resolve) => {
+    const { execSync } = require('child_process')
+
+    // Kill all PIDs holding the port (SIGKILL — no grace period needed here)
+    try {
+      const out = execSync(`lsof -ti :${port}`, { encoding: 'utf8' }).trim()
+      const pids = out.split('\n').filter(Boolean).map(Number)
+      pids.forEach((pid) => { try { process.kill(pid, 'SIGKILL') } catch {} })
+    } catch {
+      return resolve() // lsof found nothing
+    }
+
+    // Poll until the port is actually free (up to 3 s)
+    const deadline = Date.now() + 3000
+    const poll = () => {
+      try {
+        execSync(`lsof -ti :${port}`, { encoding: 'utf8', stdio: 'pipe' }).trim()
+        // still occupied
+        if (Date.now() < deadline) setTimeout(poll, 200)
+        else resolve()
+      } catch {
+        resolve() // lsof exited non-zero = no owner = port is free
+      }
+    }
+    setTimeout(poll, 200)
   })
 }
 
@@ -65,9 +118,14 @@ function runBootstrap() {
 function startBackend() {
   backendProc = spawn(VENV_PYTHON, ['-u', '-m', 'uvicorn', 'backend.main:app',
     '--port', String(BACKEND_PORT), '--host', '127.0.0.1'], {
-    cwd: ROOT,
+    cwd: APP_ROOT,
     stdio: ['ignore', 'pipe', 'pipe'],
     detached: true,   // new process group (PGID = PID) — lets us kill the whole tree
+    env: {
+      ...process.env,
+      ONICHAT_APP_ROOT:  APP_ROOT,
+      ONICHAT_USER_DATA: USER_DATA,
+    },
   })
   backendProc.stdout.on('data', (d) => { process.stdout.write(d); pushLog('stdout', d) })
   backendProc.stderr.on('data', (d) => { process.stderr.write(d); pushLog('stderr', d) })
@@ -86,13 +144,15 @@ function createWindow() {
       nodeIntegration: false,
     },
   })
-  mainWindow.loadFile(path.join(ROOT, 'app', 'loader.html'))
+  mainWindow.loadFile(path.join(APP_ROOT, 'app', 'loader.html'))
   mainWindow.on('closed', () => { mainWindow = null })
 }
 
 // ── app lifecycle ─────────────────────────────────────────────────────────────
 app.whenReady().then(async () => {
   if (!fs.existsSync(VENV_PYTHON)) {
+    // Show bootstrap window — keep it open (never close it) to avoid
+    // triggering window-all-closed → app.quit() before backend starts.
     mainWindow = new BrowserWindow({ width: 500, height: 200, resizable: false,
       webPreferences: { contextIsolation: true } })
     mainWindow.loadURL(`data:text/html,<body style="font:16px system-ui;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;background:#111;color:#fff">
@@ -104,27 +164,46 @@ app.whenReady().then(async () => {
         <div>Bootstrap failed: ${err.message}</div></body>`)
       return
     }
-    mainWindow.close()
-    mainWindow = null
+    // Transition bootstrap window into the main window instead of closing it
+    mainWindow.setSize(900, 700)
+    mainWindow.setMinimumSize(700, 500)
+    mainWindow.setResizable(true)
+    mainWindow.webPreferences = { preload: path.join(__dirname, 'preload.js'), contextIsolation: true, nodeIntegration: false }
   }
 
+  await Promise.all([killPortOwner(BACKEND_PORT), killPortOwner(50021)])
   startBackend()
 
   await new Promise((resolve, reject) => pollHealth(resolve, reject))
 
-  createWindow()
+  if (mainWindow) {
+    // Reuse bootstrap window — reload into loader
+    mainWindow.loadFile(path.join(APP_ROOT, 'app', 'loader.html'))
+  } else {
+    createWindow()
+  }
 })
 
 app.on('window-all-closed', () => app.quit())
 
-app.on('before-quit', async () => {
+app.on('will-quit', () => {
+  // Synchronous fallback — fires even when before-quit is skipped.
+  // before-quit already handles the graceful path; this just ensures the
+  // process group is gone if we get here without it having run.
   if (!backendProc) return
+  try { process.kill(-backendProc.pid, 'SIGTERM') } catch {}
+})
+
+app.on('before-quit', (e) => {
+  if (!backendProc) return
+  e.preventDefault()
   // 1. Ask the backend to flush cleanly (unload models, close sockets).
-  try {
-    await fetch(`http://127.0.0.1:${BACKEND_PORT}/shutdown`, { method: 'POST' })
-  } catch {}
+  fetch(`http://127.0.0.1:${BACKEND_PORT}/shutdown`, { method: 'POST' }).catch(() => {})
   // 2. Give it a moment, then kill the entire process group — uvicorn, llama-server,
   //    and voicevox all share the same PGID so one signal takes down the whole tree.
-  await new Promise((r) => setTimeout(r, 1000))
-  try { process.kill(-backendProc.pid, 'SIGTERM') } catch {}
+  setTimeout(() => {
+    try { process.kill(-backendProc.pid, 'SIGTERM') } catch {}
+    backendProc = null
+    app.quit()
+  }, 1000)
 })

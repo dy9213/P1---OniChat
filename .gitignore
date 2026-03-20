@@ -15,6 +15,6 @@ modules/stt/models/
 modules/tts/models/
 modules/llm/models/
 
-# Compiled binaries
-modules/llm/bin/llama-server
+# Downloaded/compiled binaries — installed at runtime
+modules/llm/bin/
 modules/tts/bin/
